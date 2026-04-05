@@ -56,13 +56,19 @@ pub const Scope = struct {
 pub const Group = struct {
     scope_state: Scope = .{},
     active: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    mutex: std.Thread.Mutex = .{},
+    idle_cond: std.Thread.Condition = .{},
 
     pub const Ticket = struct {
         group: ?*Group,
 
         pub fn done(self: *Ticket) void {
             if (self.group) |group| {
-                _ = group.active.fetchSub(1, .acq_rel);
+                group.mutex.lock();
+                defer group.mutex.unlock();
+
+                const prev = group.active.fetchSub(1, .acq_rel);
+                if (prev == 1) group.idle_cond.broadcast();
                 self.group = null;
             }
         }
@@ -85,13 +91,19 @@ pub const Group = struct {
     }
 
     pub fn begin(self: *Group) Ticket {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         _ = self.active.fetchAdd(1, .acq_rel);
         return .{ .group = self };
     }
 
+    /// Blocks the current thread until all started tickets have completed.
     pub fn wait(self: *Group) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         while (self.active.load(.acquire) != 0) {
-            std.atomic.spinLoopHint();
+            self.idle_cond.wait(&self.mutex);
         }
     }
 

@@ -144,6 +144,8 @@ pub const Coro = struct {
         self.yield_val = .none;
         self.resume_val = .none;
         self.cancel_token = null;
+        self.stdout_buf.reset();
+        self.stderr_buf.reset();
         self.ctx = .{};
         self.caller_ctx = .{};
     }
@@ -259,9 +261,9 @@ fn coroTrampoline() void {
 
     self.yield_val = .completed;
     self.state = .idle;
-    const prev = tls_current_coro;
     tls_current_coro = null;
-    defer tls_current_coro = prev;
+
+    // Control transfers back to the caller context and never resumes here.
     switchContext(&self.ctx, &self.caller_ctx);
 
     unreachable;

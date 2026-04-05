@@ -254,21 +254,22 @@ const builtin_envp = [_]?[*:0]const u8{
     null,
 };
 
-var env_loaded = false;
+var env_once = std.once(initDefaultEnv);
 var loaded_envp: [MAX_ENV + 1]?[*:0]const u8 = [_]?[*:0]const u8{null} ** (MAX_ENV + 1);
 var loaded_env_storage: [MAX_ENV][512]u8 = undefined;
 var loaded_env_count: usize = 0;
 
 fn getDefaultEnvp() [*:null]const ?[*:0]const u8 {
-    if (!env_loaded) {
-        env_loaded = true;
-        loadEnvFile("/etc/environment");
-    }
+    env_once.call();
     if (loaded_env_count > 0) {
-        loaded_envp[loaded_env_count] = null;
         return @ptrCast(&loaded_envp);
     }
     return @ptrCast(&builtin_envp);
+}
+
+fn initDefaultEnv() void {
+    loadEnvFile("/etc/environment");
+    loaded_envp[loaded_env_count] = null;
 }
 
 fn unquoteEnvLine(line: []const u8, out: *[512]u8) usize {
@@ -385,7 +386,7 @@ fn createPipe() ?[2]i32 {
 }
 
 fn clearNonblockOrExit(fd: i32, stdout_fd: i32, stderr_fd: i32) void {
-    const nonblock_mask: i32 = @as(i32, 1) << @bitOffsetOf(linux.O, "NONBLOCK");
+    const nonblock_mask: i32 = @bitCast(linux.O{ .NONBLOCK = true });
     const flags_rc = linux.fcntl(fd, linux.F.GETFL, 0);
     if (@as(isize, @bitCast(flags_rc)) < 0) {
         closeFd(stdout_fd);

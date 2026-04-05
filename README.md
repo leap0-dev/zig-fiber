@@ -42,7 +42,7 @@ That restriction is enforced in `build.zig` because the implementation depends o
 Add `zig-fiber` as a dependency in your `build.zig.zon`:
 
 ```bash
-zig fetch --save "git+https://github.com/stevenpassynkov/zig-fiber"
+zig fetch --save "git+https://github.com/leap0-dev/zig-fiber"
 ```
 
 Then import the module in `build.zig`:

@@ -73,6 +73,10 @@ pub const RuntimeState = struct {
     }
 };
 
+comptime {
+    std.debug.assert(@alignOf(RuntimeState) >= 8);
+}
+
 pub const IoUringDriver = struct {
     ring: *linux.IoUring,
     timeout_remove_user_data: u64,
@@ -241,7 +245,7 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
         ps.stdout_pending = false;
         if (cqe_res <= 0) {
             ps.stdout_eof = true;
-            co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = undefined, .len = 0, .eof = true } });
+            co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = runtime.pipe_stdout_buf[0..].ptr, .len = 0, .eof = true } });
         } else {
             const n: usize = @intCast(cqe_res);
             co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = &runtime.pipe_stdout_buf, .len = n, .eof = false } });
@@ -250,7 +254,7 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
         ps.stderr_pending = false;
         if (cqe_res <= 0) {
             ps.stderr_eof = true;
-            co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = undefined, .len = 0, .eof = true } });
+            co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = runtime.pipe_stderr_buf[0..].ptr, .len = 0, .eof = true } });
         } else {
             const n: usize = @intCast(cqe_res);
             co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = &runtime.pipe_stderr_buf, .len = n, .eof = false } });
@@ -319,7 +323,7 @@ fn handleTimeoutCompletion(driver: anytype, runtime: *RuntimeState, cqe_res: i32
 
     if (ps.child_pid > 0 and !ps.child_exited) {
         const co = runtime.coro_ref orelse return;
-        _ = linux.kill(ps.child_pid, 9);
+        _ = linux.kill(ps.child_pid, linux.SIG.KILL);
         ps.timed_out = true;
 
         tryReapChild(runtime);
