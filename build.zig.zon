@@ -1,0 +1,11 @@
+.{
+    .name = .zig_fiber,
+    .version = "0.1.0",
+    .fingerprint = 0x426784e4c7f90de3,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
