@@ -1,10 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const coro = @import("coro.zig");
 const linux = std.os.linux;
 
 /// Output slices borrow the current coroutine's buffers and become invalid once
 /// that coroutine is resumed, reset, released back to a pool, or deinitialized.
-pub const BorrowedOutput = struct {
+pub const Output = struct {
     stdout: []const u8,
     stderr: []const u8,
     exit_code: i32,
@@ -13,6 +14,7 @@ pub const BorrowedOutput = struct {
 
 pub const MAX_ENV = 64;
 pub const MAX_ARGV = 32;
+const MAX_MERGED_ENV = 256;
 
 pub const Command = struct {
     command: ?[]const u8 = null,
@@ -55,7 +57,7 @@ pub const Command = struct {
         return self;
     }
 
-    pub fn run(self: Command) !BorrowedOutput {
+    pub fn run(self: Command) !Output {
         if (self.command == null and self.args == null) return error.InvalidCommand;
         if (self.args) |args| {
             if (args.len == 0) return error.InvalidCommand;
@@ -94,6 +96,7 @@ pub const Command = struct {
 
         var env_bufs: [MAX_ENV][512]u8 = undefined;
         var env_ptrs: [MAX_ENV + 1]?[*:0]const u8 = undefined;
+        var merged_env_ptrs: [MAX_MERGED_ENV + 1]?[*:0]const u8 = undefined;
         var env_count: usize = 0;
         if (self.env_list) |env_values| {
             if (env_values.len > MAX_ENV) return error.TooManyEnvironmentVariables;
@@ -121,9 +124,9 @@ pub const Command = struct {
         }
 
         const envp: [*:null]const ?[*:0]const u8 = if (env_count > 0)
-            @ptrCast(&env_ptrs)
+            try mergeEnvp(&merged_env_ptrs, env_ptrs[0..env_count])
         else
-            getDefaultEnvp();
+            getProcessEnvp();
 
         const stdout_pipe = createPipe() orelse return error.PipeCreationFailed;
         const stderr_pipe = createPipe() orelse {
@@ -233,6 +236,7 @@ pub const Command = struct {
                     timed_out = true;
                     done = true;
                 },
+                .pipe_read_error => return error.PipeReadFailed,
                 .completed, .none, .watch_pipes => done = true,
             }
         }
@@ -273,6 +277,56 @@ fn getDefaultEnvp() [*:null]const ?[*:0]const u8 {
 fn initDefaultEnv() void {
     loadEnvFile("/etc/environment");
     loaded_envp[loaded_env_count] = null;
+}
+
+fn getProcessEnvp() [*:null]const ?[*:0]const u8 {
+    if (builtin.link_libc) {
+        return std.c.environ;
+    }
+    if (builtin.output_mode == .Exe) {
+        return @ptrCast(std.os.environ.ptr);
+    }
+    return getDefaultEnvp();
+}
+
+fn mergeEnvp(out: *[MAX_MERGED_ENV + 1]?[*:0]const u8, overrides: []const ?[*:0]const u8) ![*:null]const ?[*:0]const u8 {
+    var count: usize = 0;
+    const base = getProcessEnvp();
+    while (base[count]) |entry| : (count += 1) {
+        if (count >= MAX_MERGED_ENV) return error.TooManyEnvironmentVariables;
+        out[count] = entry;
+    }
+
+    for (overrides) |override_opt| {
+        const override = override_opt orelse continue;
+        if (!replaceEnvEntry(out[0..count], override)) {
+            if (count >= MAX_MERGED_ENV) return error.TooManyEnvironmentVariables;
+            out[count] = override;
+            count += 1;
+        }
+    }
+
+    out[count] = null;
+    return @ptrCast(out);
+}
+
+fn replaceEnvEntry(entries: []?[*:0]const u8, override: [*:0]const u8) bool {
+    for (entries, 0..) |entry_opt, i| {
+        const entry = entry_opt orelse continue;
+        if (sameEnvKey(entry, override)) {
+            entries[i] = override;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sameEnvKey(a: [*:0]const u8, b: [*:0]const u8) bool {
+    var i: usize = 0;
+    while (a[i] != 0 and a[i] != '=' and b[i] != 0 and b[i] != '=') : (i += 1) {
+        if (a[i] != b[i]) return false;
+    }
+    return a[i] == '=' and b[i] == '=';
 }
 
 fn unquoteEnvLine(line: []const u8, out: *[512]u8) usize {

@@ -2,6 +2,7 @@ pub const YieldValue = union(enum) {
     watch_pipes: WatchPipes,
     completed,
     pipe_data: PipeData,
+    pipe_read_error: PipeReadError,
     child_exited: i32,
     child_timed_out,
     none,
@@ -19,6 +20,11 @@ pub const PipeData = struct {
     buf: [*]const u8,
     len: usize,
     eof: bool,
+};
+
+pub const PipeReadError = struct {
+    fd: i32,
+    errno: i32,
 };
 
 pub const Context = extern struct {

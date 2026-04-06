@@ -137,7 +137,7 @@ fn onProcessYield(_: void, co: *fiber.Coro, _: *fiber.process.RuntimeState) void
 }
 
 const Job = struct {
-    output: ?fiber.BorrowedOutput = null,
+    output: ?fiber.Output = null,
     err: ?anyerror = null,
     runtime: fiber.ProcessRuntime = .{},
 
@@ -193,7 +193,7 @@ pub fn main() !void {
 }
 ```
 
-`Command.run()` returns `fiber.BorrowedOutput`, so the output slices are only valid until that coroutine is reused or released. `fiber.process` gives you the reusable Linux-side machinery for integrating command execution into your own event loop.
+`Command.run()` returns `fiber.Output`, and those output slices are only valid until that coroutine is reused or released. `fiber.process` gives you the reusable Linux-side machinery for integrating command execution into your own event loop.
 
 ## Building
 

@@ -47,9 +47,9 @@ pub const Coro = struct {
         const prev = tls_current_coro;
         self.yield_val = .none;
         self.state = .suspended;
-        tls_current_coro = null;
         defer tls_current_coro = prev;
         switchContext(&self.ctx, &self.caller_ctx);
+        tls_current_coro = null;
         return self.resume_val;
     }
 
@@ -57,9 +57,9 @@ pub const Coro = struct {
         const prev = tls_current_coro;
         self.yield_val = val;
         self.state = .suspended;
-        tls_current_coro = null;
         defer tls_current_coro = prev;
         switchContext(&self.ctx, &self.caller_ctx);
+        tls_current_coro = null;
         return self.resume_val;
     }
 
@@ -262,12 +262,13 @@ pub const Pool = struct {
 
 threadlocal var tls_current_coro: ?*Coro = null;
 
-threadlocal var segv_handler_installed = false;
+var segv_handler_installed = false;
 threadlocal var signal_stack: [ALT_STACK_SIZE]u8 align(16) = undefined;
 threadlocal var previous_signal_stack: linux.stack_t = .{ .sp = undefined, .flags = 0, .size = 0 };
 var previous_segv_action: linux.Sigaction = undefined;
 var previous_segv_action_installed = false;
-var segv_action_mutex: std.Thread.Mutex = .{};
+var segv_install_mutex: std.Thread.Mutex = .{};
+threadlocal var signal_stack_installed = false;
 
 fn coroTrampoline() void {
     const self = trampoline_coro orelse unreachable;
@@ -287,30 +288,27 @@ fn coroTrampoline() void {
 }
 
 fn ensureSegvHandlerInstalled() !void {
-    if (segv_handler_installed) return;
+    if (!signal_stack_installed) {
+        var ss = linux.stack_t{
+            .sp = &signal_stack,
+            .flags = 0,
+            .size = signal_stack.len,
+        };
+        try posix.sigaltstack(&ss, &previous_signal_stack);
+        signal_stack_installed = true;
+    }
 
-    var ss = linux.stack_t{
-        .sp = &signal_stack,
-        .flags = 0,
-        .size = signal_stack.len,
-    };
-    try posix.sigaltstack(&ss, &previous_signal_stack);
+    segv_install_mutex.lock();
+    defer segv_install_mutex.unlock();
+    if (segv_handler_installed) return;
 
     const act = linux.Sigaction{
         .handler = .{ .sigaction = segvHandler },
         .mask = posix.sigemptyset(),
         .flags = linux.SA.SIGINFO | linux.SA.ONSTACK | linux.SA.NODEFER,
     };
-    segv_action_mutex.lock();
-    defer segv_action_mutex.unlock();
-
-    if (!previous_segv_action_installed) {
-        posix.sigaction(linux.SIG.SEGV, &act, &previous_segv_action);
-        previous_segv_action_installed = true;
-    } else {
-        posix.sigaction(linux.SIG.SEGV, &act, null);
-    }
-
+    posix.sigaction(linux.SIG.SEGV, &act, &previous_segv_action);
+    previous_segv_action_installed = true;
     segv_handler_installed = true;
 }
 
@@ -325,34 +323,15 @@ fn segvHandler(sig: i32, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(
         }, fault_addr)) return;
     }
 
-    delegateSegv(sig, info);
-
-    const msg = "zig-fiber: unrecoverable SIGSEGV\n";
-    _ = linux.write(2, msg, msg.len);
-    linux.exit_group(127);
+    delegateSegv(sig);
 }
 
-fn delegateSegv(sig: i32, info: *const linux.siginfo_t) void {
+fn delegateSegv(sig: i32) void {
     _ = linux.sigaltstack(&previous_signal_stack, null);
-
-    segv_action_mutex.lock();
-    const prev = previous_segv_action;
-    const has_prev = previous_segv_action_installed;
-    segv_action_mutex.unlock();
-    if (!has_prev) return;
-
-    if ((prev.flags & linux.SA.SIGINFO) != 0) {
-        if (prev.handler.sigaction) |handler| {
-            handler(sig, info, null);
-            return;
-        }
-    } else if (prev.handler.handler) |handler| {
-        handler(sig);
-        return;
+    if (previous_segv_action_installed) {
+        _ = linux.sigaction(linux.SIG.SEGV, &previous_segv_action, null);
     }
-
-    posix.sigaction(linux.SIG.SEGV, &prev, null);
-    _ = linux.kill(linux.getpid(), linux.SIG.SEGV);
+    _ = linux.kill(linux.getpid(), sig);
 }
 
 fn allocateNode() !*CoroNode {

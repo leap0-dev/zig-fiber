@@ -59,6 +59,7 @@ pub const PipeState = struct {
 
 pub const RuntimeState = struct {
     coro_ref: ?*coro.Coro = null,
+    version: u8 = 1,
     pipe_state: PipeState = .{},
     pipe_stdout_buf: [PIPE_READ_BUF_SIZE]u8 = undefined,
     pipe_stderr_buf: [PIPE_READ_BUF_SIZE]u8 = undefined,
@@ -68,6 +69,8 @@ pub const RuntimeState = struct {
     pub fn reset(self: *RuntimeState) void {
         self.pipe_state.reset();
         self.coro_ref = null;
+        self.version +%= 1;
+        if (self.version == 0) self.version = 1;
         self.timeout_spec = .{ .sec = 0, .nsec = 0 };
         self.reap_retry_spec = .{ .sec = 0, .nsec = 0 };
     }
@@ -127,7 +130,7 @@ pub const Runtime = struct {
     }
 
     pub fn owns(self: *const Runtime, user_data: u64) bool {
-        return isUserData(user_data) and decodeState(user_data) == &self.state;
+        return isUserData(user_data) and decodeState(user_data) == &self.state and decodeVersion(user_data) == self.state.version;
     }
 
     pub fn handleCqe(self: *Runtime, driver: anytype, completion: Completion, callback_ctx: anytype, comptime on_yield: anytype) void {
@@ -137,13 +140,16 @@ pub const Runtime = struct {
 };
 
 pub const USER_DATA_FLAG: u64 = 1 << 63;
+const VERSION_SHIFT: u6 = 55;
+const VERSION_MASK: u64 = 0xFF << VERSION_SHIFT;
+const POINTER_MASK: u64 = ((@as(u64, 1) << VERSION_SHIFT) - 1) & ~@as(u64, 0x7);
 pub const TYPE_STDOUT: u64 = 0;
 pub const TYPE_STDERR: u64 = 1;
 pub const TYPE_WAITID: u64 = 2;
 pub const TYPE_TIMEOUT: u64 = 3;
 
 pub fn encodeUserData(runtime: *RuntimeState, pipe_type: u64) u64 {
-    return (@intFromPtr(runtime) & ~@as(u64, 0x7)) | (pipe_type & 0x7) | USER_DATA_FLAG;
+    return (@intFromPtr(runtime) & POINTER_MASK) | ((@as(u64, runtime.version) << VERSION_SHIFT) & VERSION_MASK) | (pipe_type & 0x7) | USER_DATA_FLAG;
 }
 
 pub fn isUserData(user_data: u64) bool {
@@ -151,11 +157,15 @@ pub fn isUserData(user_data: u64) bool {
 }
 
 pub fn decodeState(user_data: u64) *RuntimeState {
-    return @ptrFromInt(user_data & ~(USER_DATA_FLAG | @as(u64, 0x7)));
+    return @ptrFromInt(user_data & POINTER_MASK);
 }
 
 pub fn decodeType(user_data: u64) u64 {
     return user_data & 0x7;
+}
+
+pub fn decodeVersion(user_data: u64) u8 {
+    return @intCast((user_data & VERSION_MASK) >> VERSION_SHIFT);
 }
 
 pub fn beginWatch(driver: anytype, runtime: *RuntimeState, pipes: coro.WatchPipes, coro_index: usize) void {
@@ -165,6 +175,8 @@ pub fn beginWatch(driver: anytype, runtime: *RuntimeState, pipes: coro.WatchPipe
         .stdout_fd = pipes.stdout_fd,
         .stderr_fd = pipes.stderr_fd,
         .child_pid = pipes.child_pid,
+        .stdout_eof = pipes.stdout_fd == -1,
+        .stderr_eof = pipes.stderr_fd == -1,
         .active = true,
         .timeout_sec = pipes.timeout_sec,
     };
@@ -221,11 +233,15 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
         tryReapChild(runtime);
 
         if (runtime.pipe_state.timed_out) {
+            if (!runtime.pipe_state.child_exited) {
+                scheduleReapRetry(driver, runtime, co.index);
+                return;
+            }
+
             if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
             runtime.pipe_state.closePipes();
             runtime.pipe_state.stdout_eof = true;
             runtime.pipe_state.stderr_eof = true;
-            runtime.pipe_state.child_exited = true;
             runtime.pipe_state.exit_status = -1;
             runtime.pipe_state.reset();
             co.contWith(.child_timed_out);
@@ -251,27 +267,9 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
     const ci = co.index;
 
     if (pipe_type == TYPE_STDOUT) {
-        ps.stdout_pending = false;
-        if (cqe_res <= 0) {
-            ps.stdout_eof = true;
-            co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = runtime.pipe_stdout_buf[0..].ptr, .len = 0, .eof = true } });
-        } else if (!ps.timed_out) {
-            const n: usize = @intCast(cqe_res);
-            co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = &runtime.pipe_stdout_buf, .len = n, .eof = false } });
-        } else {
-            tryReapChild(runtime);
-        }
+        handlePipeReadCompletion(runtime, co, cqe_res, .stdout);
     } else if (pipe_type == TYPE_STDERR) {
-        ps.stderr_pending = false;
-        if (cqe_res <= 0) {
-            ps.stderr_eof = true;
-            co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = runtime.pipe_stderr_buf[0..].ptr, .len = 0, .eof = true } });
-        } else if (!ps.timed_out) {
-            const n: usize = @intCast(cqe_res);
-            co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = &runtime.pipe_stderr_buf, .len = n, .eof = false } });
-        } else {
-            tryReapChild(runtime);
-        }
+        handlePipeReadCompletion(runtime, co, cqe_res, .stderr);
     }
 
     if (co.yield_val == .completed) {
@@ -360,6 +358,51 @@ fn handleTimeoutCompletion(driver: anytype, runtime: *RuntimeState, cqe_res: i32
 
 fn handlePipeReadSubmitError(coro_index: usize, stream_name: []const u8, err: anyerror) void {
     std.log.err("failed to submit {s} pipe read: coro_id={d} err={s}", .{ stream_name, coro_index, @errorName(err) });
+}
+
+const PipeKind = enum {
+    stdout,
+    stderr,
+};
+
+fn handlePipeReadCompletion(runtime: *RuntimeState, co: *coro.Coro, cqe_res: i32, kind: PipeKind) void {
+    const ps = &runtime.pipe_state;
+    const fd = switch (kind) {
+        .stdout => blk: {
+            ps.stdout_pending = false;
+            break :blk ps.stdout_fd;
+        },
+        .stderr => blk: {
+            ps.stderr_pending = false;
+            break :blk ps.stderr_fd;
+        },
+    };
+    const buf = switch (kind) {
+        .stdout => &runtime.pipe_stdout_buf,
+        .stderr => &runtime.pipe_stderr_buf,
+    };
+
+    if (cqe_res == 0) {
+        switch (kind) {
+            .stdout => ps.stdout_eof = true,
+            .stderr => ps.stderr_eof = true,
+        }
+        co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf[0..].ptr, .len = 0, .eof = true } });
+        return;
+    }
+
+    if (cqe_res < 0) {
+        co.contWith(.{ .pipe_read_error = .{ .fd = fd, .errno = -cqe_res } });
+        return;
+    }
+
+    if (ps.timed_out) {
+        tryReapChild(runtime);
+        return;
+    }
+
+    const n: usize = @intCast(cqe_res);
+    co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf, .len = n, .eof = false } });
 }
 
 fn submitPipeReadWithRetry(ring: *linux.IoUring, user_data: u64, fd: i32, buffer: []u8, coro_index: usize, stream_name: []const u8) bool {
