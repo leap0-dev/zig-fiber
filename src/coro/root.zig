@@ -87,10 +87,7 @@ pub const Coro = struct {
         trampoline_coro = self;
         trampoline_func = func;
         self.state = .running;
-        const prev = tls_current_coro;
-        tls_current_coro = self;
-        defer tls_current_coro = prev;
-        switchContext(&self.caller_ctx, &self.ctx);
+        resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
     }
 
     pub fn cont(self: *Coro) void {
@@ -98,10 +95,7 @@ pub const Coro = struct {
 
         self.resume_val = .none;
         self.state = .running;
-        const prev = tls_current_coro;
-        tls_current_coro = self;
-        defer tls_current_coro = prev;
-        switchContext(&self.caller_ctx, &self.ctx);
+        resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
     }
 
     pub fn contWith(self: *Coro, val: YieldValue) void {
@@ -109,10 +103,7 @@ pub const Coro = struct {
 
         self.resume_val = val;
         self.state = .running;
-        const prev = tls_current_coro;
-        tls_current_coro = self;
-        defer tls_current_coro = prev;
-        switchContext(&self.caller_ctx, &self.ctx);
+        resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
     }
 
     pub fn current() *Coro {
@@ -180,7 +171,8 @@ pub const Pool = struct {
     }
 
     pub fn acquire(self: *Pool) ?*Coro {
-        ensureSegvHandlerInstalled() catch return null;
+        ensureSignalStackInstalled() catch return null;
+        ensureSegvActionInstalled();
 
         if (self.idle) |node| {
             self.idle = node.idle_next;
@@ -287,17 +279,28 @@ fn coroTrampoline() void {
     unreachable;
 }
 
-fn ensureSegvHandlerInstalled() !void {
-    if (!signal_stack_installed) {
-        var ss = linux.stack_t{
-            .sp = &signal_stack,
-            .flags = 0,
-            .size = signal_stack.len,
-        };
-        try posix.sigaltstack(&ss, &previous_signal_stack);
-        signal_stack_installed = true;
-    }
+fn resumeOnCurrentThread(self: *Coro, from: *Context, to: *const Context) void {
+    ensureSignalStackInstalled() catch unreachable;
+    ensureSegvActionInstalled();
+    const prev = tls_current_coro;
+    tls_current_coro = self;
+    defer tls_current_coro = prev;
+    switchContext(from, to);
+}
 
+fn ensureSignalStackInstalled() !void {
+    if (signal_stack_installed) return;
+
+    var ss = linux.stack_t{
+        .sp = &signal_stack,
+        .flags = 0,
+        .size = signal_stack.len,
+    };
+    try posix.sigaltstack(&ss, &previous_signal_stack);
+    signal_stack_installed = true;
+}
+
+fn ensureSegvActionInstalled() void {
     segv_install_mutex.lock();
     defer segv_install_mutex.unlock();
     if (segv_handler_installed) return;

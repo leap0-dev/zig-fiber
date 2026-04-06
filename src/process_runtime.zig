@@ -122,7 +122,7 @@ pub const Runtime = struct {
         return switch (co.yield_val) {
             .watch_pipes => |pipes| blk: {
                 beginWatch(driver, &self.state, pipes, co.index);
-                break :blk .pending;
+                break :blk if (co.yield_val == .completed) .completed else .pending;
             },
             .completed => .completed,
             else => error.UnexpectedYield,
@@ -171,6 +171,8 @@ pub fn decodeVersion(user_data: u64) u8 {
 pub fn beginWatch(driver: anytype, runtime: *RuntimeState, pipes: coro.WatchPipes, coro_index: usize) void {
     std.debug.assert(runtime.coro_ref != null);
     runtime.pipe_state.reset();
+    runtime.version +%= 1;
+    if (runtime.version == 0) runtime.version = 1;
     runtime.pipe_state = .{
         .stdout_fd = pipes.stdout_fd,
         .stderr_fd = pipes.stderr_fd,
@@ -182,6 +184,13 @@ pub fn beginWatch(driver: anytype, runtime: *RuntimeState, pipes: coro.WatchPipe
     };
     submitPipeReads(driver, runtime, coro_index);
     tryReapChild(runtime);
+    if (runtime.pipe_state.allDone()) {
+        const co = runtime.coro_ref orelse return;
+        const exit_status = runtime.pipe_state.exit_status;
+        runtime.pipe_state.reset();
+        co.contWith(.{ .child_exited = exit_status });
+        return;
+    }
     if (runtime.pipe_state.stdout_eof and runtime.pipe_state.stderr_eof and !runtime.pipe_state.child_exited) {
         scheduleReapRetry(driver, runtime, coro_index);
     }
@@ -238,24 +247,17 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
                 return;
             }
 
-            if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
             runtime.pipe_state.closePipes();
             runtime.pipe_state.stdout_eof = true;
             runtime.pipe_state.stderr_eof = true;
             runtime.pipe_state.exit_status = -1;
-            runtime.pipe_state.reset();
-            co.contWith(.child_timed_out);
-            on_yield(callback_ctx, co, runtime);
+            finishTimedOut(driver, runtime, co, callback_ctx, on_yield);
             return;
         }
 
         if (!runtime.pipe_state.child_exited and runtime.pipe_state.active) scheduleReapRetry(driver, runtime, co.index);
         if (runtime.pipe_state.allDone()) {
-            const exit_status = runtime.pipe_state.exit_status;
-            if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
-            runtime.pipe_state.reset();
-            co.contWith(.{ .child_exited = exit_status });
-            on_yield(callback_ctx, co, runtime);
+            finishExited(driver, runtime, co, callback_ctx, on_yield);
         }
         return;
     }
@@ -283,11 +285,7 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
     if (ps.stdout_eof and ps.stderr_eof and !ps.child_exited) scheduleReapRetry(driver, runtime, ci);
 
     if (ps.allDone()) {
-        const exit_status = ps.exit_status;
-        if (ps.timeout_sec > 0) cancelTimeout(driver, runtime);
-        ps.reset();
-        co.contWith(.{ .child_exited = exit_status });
-        on_yield(callback_ctx, co, runtime);
+        finishExited(driver, runtime, co, callback_ctx, on_yield);
     } else {
         submitPipeReads(driver, runtime, ci);
     }
@@ -348,10 +346,7 @@ fn handleTimeoutCompletion(driver: anytype, runtime: *RuntimeState, cqe_res: i32
         ps.stderr_eof = true;
 
         if (ps.allDone()) {
-            if (ps.timeout_sec > 0) cancelTimeout(driver, runtime);
-            ps.reset();
-            co.contWith(.child_timed_out);
-            on_yield(callback_ctx, co, runtime);
+            finishTimedOut(driver, runtime, co, callback_ctx, on_yield);
         }
     }
 }
@@ -403,6 +398,21 @@ fn handlePipeReadCompletion(runtime: *RuntimeState, co: *coro.Coro, cqe_res: i32
 
     const n: usize = @intCast(cqe_res);
     co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf, .len = n, .eof = false } });
+}
+
+fn finishExited(driver: anytype, runtime: *RuntimeState, co: *coro.Coro, callback_ctx: anytype, comptime on_yield: anytype) void {
+    const exit_status = runtime.pipe_state.exit_status;
+    if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
+    runtime.pipe_state.reset();
+    co.contWith(.{ .child_exited = exit_status });
+    on_yield(callback_ctx, co, runtime);
+}
+
+fn finishTimedOut(driver: anytype, runtime: *RuntimeState, co: *coro.Coro, callback_ctx: anytype, comptime on_yield: anytype) void {
+    if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
+    runtime.pipe_state.reset();
+    co.contWith(.child_timed_out);
+    on_yield(callback_ctx, co, runtime);
 }
 
 fn submitPipeReadWithRetry(ring: *linux.IoUring, user_data: u64, fd: i32, buffer: []u8, coro_index: usize, stream_name: []const u8) bool {

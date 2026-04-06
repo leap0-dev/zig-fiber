@@ -63,11 +63,9 @@ pub const Command = struct {
             if (args.len == 0) return error.InvalidCommand;
         }
 
-        if (self.cancel_token) |token| {
-            if (token.isCancelled()) return error.Cancelled;
-        }
-
         const co = coro.Coro.maybeCurrent() orelse return error.NotInCoro;
+        const inherited_cancel_token = co.getCancelToken();
+        try checkCancellation(self.cancel_token, inherited_cancel_token);
 
         var cmd_buf: [4096]u8 = undefined;
         var cmd_len: usize = 0;
@@ -112,14 +110,14 @@ pub const Command = struct {
         }
 
         var cwd_buf: [512]u8 = undefined;
-        var has_cwd = false;
+        var use_cwd = false;
         if (self.cwd_path) |d| {
             if (d.len > 0) {
                 if (d.len > cwd_buf.len - 1) return error.CwdTooLong;
                 const cwd_len = d.len;
                 @memcpy(cwd_buf[0..cwd_len], d[0..cwd_len]);
                 cwd_buf[cwd_len] = 0;
-                has_cwd = true;
+                use_cwd = true;
             }
         }
 
@@ -168,7 +166,7 @@ pub const Command = struct {
             closeFd(stdout_pipe[1]);
             closeFd(stderr_pipe[1]);
 
-            if (has_cwd) {
+            if (use_cwd) {
                 const chdir_rc = linux.chdir(@ptrCast(&cwd_buf));
                 if (@as(isize, @bitCast(chdir_rc)) < 0) {
                     childExitErrno(chdir_rc);
@@ -189,21 +187,22 @@ pub const Command = struct {
         closeFd(stdout_pipe[1]);
         closeFd(stderr_pipe[1]);
 
+        const stdout_watch_fd = stdout_pipe[0];
+        const stderr_watch_fd = stderr_pipe[0];
+        var cleanup_stdout_fd = stdout_watch_fd;
+        var cleanup_stderr_fd = stderr_watch_fd;
+
         var child_cleanup_needed = true;
-        defer if (child_cleanup_needed) cancelRunningChild(pid, stdout_pipe[0], stderr_pipe[0]);
+        defer if (child_cleanup_needed) cancelRunningChild(pid, cleanup_stdout_fd, cleanup_stderr_fd);
 
-        const prev_token = co.getCancelToken();
-        if (self.cancel_token != null) {
-            co.setCancelToken(self.cancel_token);
-        }
-        defer co.setCancelToken(prev_token);
-
-        _ = try co.yieldWithCancellable(.{ .watch_pipes = .{
-            .stdout_fd = stdout_pipe[0],
-            .stderr_fd = stderr_pipe[0],
+        _ = try yieldWithChecked(co, .{ .watch_pipes = .{
+            .stdout_fd = stdout_watch_fd,
+            .stderr_fd = stderr_watch_fd,
             .child_pid = pid,
             .timeout_sec = self.timeout_secs,
-        } });
+        } }, self.cancel_token, inherited_cancel_token);
+        cleanup_stdout_fd = -1;
+        cleanup_stderr_fd = -1;
 
         co.stdout_buf.reset();
         co.stderr_buf.reset();
@@ -213,20 +212,16 @@ pub const Command = struct {
         var done = false;
 
         while (!done) {
-            co.checkpoint() catch {
-                return error.Cancelled;
-            };
+            try checkCancellation(self.cancel_token, inherited_cancel_token);
 
             switch (co.resume_val) {
-                .pipe_data => |pd| {
-                    if (pd.fd == stdout_pipe[0] and !pd.eof) {
-                        try co.stdout_buf.append(pd.buf[0..pd.len]);
-                    } else if (pd.fd == stderr_pipe[0] and !pd.eof) {
-                        try co.stderr_buf.append(pd.buf[0..pd.len]);
+                .pipe_data => |pipe_data| {
+                    if (pipe_data.fd == stdout_watch_fd and !pipe_data.eof) {
+                        try co.stdout_buf.append(pipe_data.buf[0..pipe_data.len]);
+                    } else if (pipe_data.fd == stderr_watch_fd and !pipe_data.eof) {
+                        try co.stderr_buf.append(pipe_data.buf[0..pipe_data.len]);
                     }
-                    _ = co.yieldCancellable() catch {
-                        return error.Cancelled;
-                    };
+                    _ = try yieldChecked(co, self.cancel_token, inherited_cancel_token);
                 },
                 .child_exited => |code| {
                     exit_code = code;
@@ -241,8 +236,6 @@ pub const Command = struct {
             }
         }
 
-        closeFd(stdout_pipe[0]);
-        closeFd(stderr_pipe[0]);
         child_cleanup_needed = false;
 
         return .{
@@ -253,6 +246,28 @@ pub const Command = struct {
         };
     }
 };
+
+fn checkCancellation(token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) coro.CancelError!void {
+    if (isAnyCancelled(token, inherited)) return error.Cancelled;
+}
+
+fn yieldChecked(co: *coro.Coro, token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) coro.CancelError!coro.YieldValue {
+    const val = co.yield();
+    try checkCancellation(token, inherited);
+    return val;
+}
+
+fn yieldWithChecked(co: *coro.Coro, val: coro.YieldValue, token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) coro.CancelError!coro.YieldValue {
+    const out = co.yieldWith(val);
+    try checkCancellation(token, inherited);
+    return out;
+}
+
+fn isAnyCancelled(token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) bool {
+    if (token) |value| if (value.isCancelled()) return true;
+    if (inherited) |value| if (value.isCancelled()) return true;
+    return false;
+}
 
 const builtin_envp = [_]?[*:0]const u8{
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
