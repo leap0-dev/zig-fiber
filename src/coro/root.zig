@@ -64,6 +64,8 @@ pub const Coro = struct {
     }
 
     pub fn start(self: *Coro, func: *const fn (*Coro) void) void {
+        std.debug.assert(self.state == .ready);
+
         const stack = self.pool.stackFor(self);
         const stack_top = @intFromPtr(stack.ptr) + stack.len;
         const aligned_top = stack_top & ~@as(usize, 0xF);
@@ -92,6 +94,8 @@ pub const Coro = struct {
     }
 
     pub fn cont(self: *Coro) void {
+        std.debug.assert(self.state == .suspended);
+
         self.resume_val = .none;
         self.state = .running;
         const prev = tls_current_coro;
@@ -101,6 +105,8 @@ pub const Coro = struct {
     }
 
     pub fn contWith(self: *Coro, val: YieldValue) void {
+        std.debug.assert(self.state == .suspended);
+
         self.resume_val = val;
         self.state = .running;
         const prev = tls_current_coro;
@@ -111,6 +117,10 @@ pub const Coro = struct {
 
     pub fn current() *Coro {
         return tls_current_coro orelse unreachable;
+    }
+
+    pub fn maybeCurrent() ?*Coro {
+        return tls_current_coro;
     }
 
     pub fn setCancelToken(self: *Coro, token: ?*CancelToken) void {
@@ -144,6 +154,7 @@ pub const Coro = struct {
         self.yield_val = .none;
         self.resume_val = .none;
         self.cancel_token = null;
+        self.user_data = null;
         self.stdout_buf.reset();
         self.stderr_buf.reset();
         self.ctx = .{};
@@ -175,7 +186,7 @@ pub const Pool = struct {
             self.idle = node.idle_next;
             node.idle_next = null;
             node.coro.reset();
-            node.coro.state = .running;
+            node.coro.state = .ready;
             return &node.coro;
         }
 
@@ -199,11 +210,12 @@ pub const Pool = struct {
         node.all_next = self.all;
         self.all = node;
 
-        node.coro.state = .running;
+        node.coro.state = .ready;
         return &node.coro;
     }
 
     pub fn release(self: *Pool, co: *Coro) void {
+        std.debug.assert(co.state != .running and co.state != .suspended);
         co.reset();
         const node = nodeFromCoro(co);
         node.idle_next = self.idle;
@@ -227,6 +239,7 @@ pub const Pool = struct {
         var node = self.all;
         self.idle = null;
         while (node) |n| : (node = n.all_next) {
+            std.debug.assert(n.coro.state != .running and n.coro.state != .suspended);
             n.coro.reset();
             n.idle_next = self.idle;
             self.idle = n;
@@ -251,6 +264,10 @@ threadlocal var tls_current_coro: ?*Coro = null;
 
 threadlocal var segv_handler_installed = false;
 threadlocal var signal_stack: [ALT_STACK_SIZE]u8 align(16) = undefined;
+threadlocal var previous_signal_stack: linux.stack_t = .{ .sp = undefined, .flags = 0, .size = 0 };
+var previous_segv_action: linux.Sigaction = undefined;
+var previous_segv_action_installed = false;
+var segv_action_mutex: std.Thread.Mutex = .{};
 
 fn coroTrampoline() void {
     const self = trampoline_coro orelse unreachable;
@@ -277,20 +294,27 @@ fn ensureSegvHandlerInstalled() !void {
         .flags = 0,
         .size = signal_stack.len,
     };
-    try posix.sigaltstack(&ss, null);
+    try posix.sigaltstack(&ss, &previous_signal_stack);
 
     const act = linux.Sigaction{
         .handler = .{ .sigaction = segvHandler },
         .mask = posix.sigemptyset(),
         .flags = linux.SA.SIGINFO | linux.SA.ONSTACK | linux.SA.NODEFER,
     };
-    posix.sigaction(linux.SIG.SEGV, &act, null);
+    segv_action_mutex.lock();
+    defer segv_action_mutex.unlock();
+
+    if (!previous_segv_action_installed) {
+        posix.sigaction(linux.SIG.SEGV, &act, &previous_segv_action);
+        previous_segv_action_installed = true;
+    } else {
+        posix.sigaction(linux.SIG.SEGV, &act, null);
+    }
+
     segv_handler_installed = true;
 }
 
 fn segvHandler(sig: i32, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    _ = sig;
-
     const fault_addr = @intFromPtr(info.fields.sigfault.addr);
     if (tls_current_coro) |co| {
         const stack = &nodeFromCoro(co).stack;
@@ -301,9 +325,34 @@ fn segvHandler(sig: i32, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(
         }, fault_addr)) return;
     }
 
+    delegateSegv(sig, info);
+
     const msg = "zig-fiber: unrecoverable SIGSEGV\n";
     _ = linux.write(2, msg, msg.len);
     linux.exit_group(127);
+}
+
+fn delegateSegv(sig: i32, info: *const linux.siginfo_t) void {
+    _ = linux.sigaltstack(&previous_signal_stack, null);
+
+    segv_action_mutex.lock();
+    const prev = previous_segv_action;
+    const has_prev = previous_segv_action_installed;
+    segv_action_mutex.unlock();
+    if (!has_prev) return;
+
+    if ((prev.flags & linux.SA.SIGINFO) != 0) {
+        if (prev.handler.sigaction) |handler| {
+            handler(sig, info, null);
+            return;
+        }
+    } else if (prev.handler.handler) |handler| {
+        handler(sig);
+        return;
+    }
+
+    posix.sigaction(linux.SIG.SEGV, &prev, null);
+    _ = linux.kill(linux.getpid(), linux.SIG.SEGV);
 }
 
 fn allocateNode() !*CoroNode {
@@ -339,7 +388,7 @@ test "pool acquires and releases coroutines" {
     defer pool.deinit();
 
     const co = pool.acquire() orelse return error.TestUnexpectedResult;
-    try std.testing.expect(co.state == .running);
+    try std.testing.expect(co.state == .ready);
     pool.release(co);
     try std.testing.expect(co.state == .idle);
 }

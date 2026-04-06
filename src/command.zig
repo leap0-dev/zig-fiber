@@ -2,7 +2,9 @@ const std = @import("std");
 const coro = @import("coro.zig");
 const linux = std.os.linux;
 
-pub const Output = struct {
+/// Output slices borrow the current coroutine's buffers and become invalid once
+/// that coroutine is resumed, reset, released back to a pool, or deinitialized.
+pub const BorrowedOutput = struct {
     stdout: []const u8,
     stderr: []const u8,
     exit_code: i32,
@@ -53,7 +55,7 @@ pub const Command = struct {
         return self;
     }
 
-    pub fn run(self: Command) !Output {
+    pub fn run(self: Command) !BorrowedOutput {
         if (self.command == null and self.args == null) return error.InvalidCommand;
         if (self.args) |args| {
             if (args.len == 0) return error.InvalidCommand;
@@ -62,6 +64,8 @@ pub const Command = struct {
         if (self.cancel_token) |token| {
             if (token.isCancelled()) return error.Cancelled;
         }
+
+        const co = coro.Coro.maybeCurrent() orelse return error.NotInCoro;
 
         var cmd_buf: [4096]u8 = undefined;
         var cmd_len: usize = 0;
@@ -185,7 +189,6 @@ pub const Command = struct {
         var child_cleanup_needed = true;
         defer if (child_cleanup_needed) cancelRunningChild(pid, stdout_pipe[0], stderr_pipe[0]);
 
-        const co = coro.Coro.current();
         const prev_token = co.getCancelToken();
         if (self.cancel_token != null) {
             co.setCancelToken(self.cancel_token);
@@ -469,4 +472,9 @@ test "command reports pre-cancelled scope" {
     var cmd = Command.shell("echo hi");
     _ = cmd.scope(&scope);
     try std.testing.expectError(error.Cancelled, cmd.run());
+}
+
+test "command requires current coroutine" {
+    var cmd = Command.shell("echo hi");
+    try std.testing.expectError(error.NotInCoro, cmd.run());
 }

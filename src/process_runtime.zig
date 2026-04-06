@@ -66,8 +66,8 @@ pub const RuntimeState = struct {
     reap_retry_spec: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
 
     pub fn reset(self: *RuntimeState) void {
+        self.pipe_state.reset();
         self.coro_ref = null;
-        self.pipe_state = .{};
         self.timeout_spec = .{ .sec = 0, .nsec = 0 };
         self.reap_retry_spec = .{ .sec = 0, .nsec = 0 };
     }
@@ -160,6 +160,7 @@ pub fn decodeType(user_data: u64) u64 {
 
 pub fn beginWatch(driver: anytype, runtime: *RuntimeState, pipes: coro.WatchPipes, coro_index: usize) void {
     std.debug.assert(runtime.coro_ref != null);
+    runtime.pipe_state.reset();
     runtime.pipe_state = .{
         .stdout_fd = pipes.stdout_fd,
         .stderr_fd = pipes.stderr_fd,
@@ -183,18 +184,12 @@ pub fn submitPipeReads(driver: anytype, runtime: *RuntimeState, coro_index: usiz
     if (ps.stdout_fd >= 0 and !ps.stdout_eof and !ps.stdout_pending) {
         if (driver.submitPipeRead(encodeUserData(runtime, TYPE_STDOUT), ps.stdout_fd, runtime.pipe_stdout_buf[0..], coro_index, "stdout")) {
             ps.stdout_pending = true;
-        } else {
-            ps.stdout_eof = true;
-            ps.stdout_pending = false;
         }
     }
 
     if (ps.stderr_fd >= 0 and !ps.stderr_eof and !ps.stderr_pending) {
         if (driver.submitPipeRead(encodeUserData(runtime, TYPE_STDERR), ps.stderr_fd, runtime.pipe_stderr_buf[0..], coro_index, "stderr")) {
             ps.stderr_pending = true;
-        } else {
-            ps.stderr_eof = true;
-            ps.stderr_pending = false;
         }
     }
 }
@@ -224,6 +219,20 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
     if (pipe_type == TYPE_WAITID) {
         const co = runtime.coro_ref orelse return;
         tryReapChild(runtime);
+
+        if (runtime.pipe_state.timed_out) {
+            if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
+            runtime.pipe_state.closePipes();
+            runtime.pipe_state.stdout_eof = true;
+            runtime.pipe_state.stderr_eof = true;
+            runtime.pipe_state.child_exited = true;
+            runtime.pipe_state.exit_status = -1;
+            runtime.pipe_state.reset();
+            co.contWith(.child_timed_out);
+            on_yield(callback_ctx, co, runtime);
+            return;
+        }
+
         if (!runtime.pipe_state.child_exited and runtime.pipe_state.active) scheduleReapRetry(driver, runtime, co.index);
         if (runtime.pipe_state.allDone()) {
             const exit_status = runtime.pipe_state.exit_status;
@@ -236,7 +245,7 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
     }
 
     const ps = &runtime.pipe_state;
-    if (!ps.active or ps.timed_out) return;
+    if (!ps.active) return;
 
     const co = runtime.coro_ref orelse return;
     const ci = co.index;
@@ -246,18 +255,22 @@ pub fn handleCompletion(driver: anytype, user_data: u64, cqe_res: i32, callback_
         if (cqe_res <= 0) {
             ps.stdout_eof = true;
             co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = runtime.pipe_stdout_buf[0..].ptr, .len = 0, .eof = true } });
-        } else {
+        } else if (!ps.timed_out) {
             const n: usize = @intCast(cqe_res);
             co.contWith(.{ .pipe_data = .{ .fd = ps.stdout_fd, .buf = &runtime.pipe_stdout_buf, .len = n, .eof = false } });
+        } else {
+            tryReapChild(runtime);
         }
     } else if (pipe_type == TYPE_STDERR) {
         ps.stderr_pending = false;
         if (cqe_res <= 0) {
             ps.stderr_eof = true;
             co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = runtime.pipe_stderr_buf[0..].ptr, .len = 0, .eof = true } });
-        } else {
+        } else if (!ps.timed_out) {
             const n: usize = @intCast(cqe_res);
             co.contWith(.{ .pipe_data = .{ .fd = ps.stderr_fd, .buf = &runtime.pipe_stderr_buf, .len = n, .eof = false } });
+        } else {
+            tryReapChild(runtime);
         }
     }
 

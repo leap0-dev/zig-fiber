@@ -137,13 +137,13 @@ fn onProcessYield(_: void, co: *fiber.Coro, _: *fiber.process.RuntimeState) void
 }
 
 const Job = struct {
-    output: ?fiber.Output = null,
+    output: ?fiber.BorrowedOutput = null,
     err: ?anyerror = null,
-    runtime: fiber.process.RuntimeState = .{},
+    runtime: fiber.ProcessRuntime = .{},
 
     fn run(co: *fiber.Coro) void {
         const job: *Job = @ptrCast(@alignCast(co.user_data.?));
-        job.runtime.coro_ref = co;
+        job.runtime.bind(co);
 
         var cmd = fiber.Command.shell("echo hello from zig-fiber");
         job.output = cmd.run() catch |err| {
@@ -159,6 +159,7 @@ pub fn main() !void {
 
     var ring = try std.os.linux.IoUring.init(8, 0);
     defer ring.deinit();
+    var driver = fiber.IoUringDriver.init(&ring, 0);
 
     var job = Job{};
     const co = pool.acquire() orelse return error.OutOfMemory;
@@ -169,14 +170,14 @@ pub fn main() !void {
 
     switch (co.yield_val) {
         .watch_pipes => |pipes| {
-            fiber.process.beginWatch(&ring, &job.runtime, pipes, co.index);
+            fiber.process.beginWatch(&driver, &job.runtime.state, pipes, co.index);
 
             var cqes: [8]std.os.linux.io_uring_cqe = undefined;
             while (co.yield_val != .completed) {
                 const count = try ring.copy_cqes(&cqes, 1);
                 for (cqes[0..count]) |cqe| {
                     if (!fiber.process.isUserData(cqe.user_data)) continue;
-                    fiber.process.handleCompletion(&ring, 0, cqe.user_data, cqe.res, {}, onProcessYield);
+                    fiber.process.handleCompletion(&driver, cqe.user_data, cqe.res, {}, onProcessYield);
                 }
                 _ = try ring.submit();
             }
@@ -192,7 +193,7 @@ pub fn main() !void {
 }
 ```
 
-`Command.run()` runs inside a `Coro` and yields process events back to the caller. `fiber.process` gives you the reusable Linux-side machinery for integrating command execution into your own event loop.
+`Command.run()` returns `fiber.BorrowedOutput`, so the output slices are only valid until that coroutine is reused or released. `fiber.process` gives you the reusable Linux-side machinery for integrating command execution into your own event loop.
 
 ## Building
 

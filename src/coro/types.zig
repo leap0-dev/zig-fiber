@@ -33,6 +33,7 @@ pub const Context = extern struct {
 
 pub const State = enum {
     idle,
+    ready,
     running,
     suspended,
 };

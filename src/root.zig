@@ -14,7 +14,7 @@ pub const CancelToken = coro.CancelToken;
 pub const Scope = coro.Scope;
 pub const Group = coro.Group;
 pub const Command = command.Command;
-pub const Output = command.Output;
+pub const BorrowedOutput = command.BorrowedOutput;
 pub const ProcessRuntime = process.Runtime;
 pub const IoUringDriver = process.IoUringDriver;
 
