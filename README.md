@@ -101,10 +101,10 @@ pub fn main() !void {
 
     co.user_data = &job;
 
-    co.start(Job.run);
+    try co.start(Job.run);
     std.debug.assert(job.value == 41);
 
-    co.cont();
+    try co.cont();
     std.debug.assert(job.value == 42);
 }
 ```
@@ -166,7 +166,7 @@ pub fn main() !void {
     defer pool.release(co);
 
     co.user_data = &job;
-    co.start(Job.run);
+    try co.start(Job.run);
 
     switch (co.yield_val) {
         .watch_pipes => |pipes| {

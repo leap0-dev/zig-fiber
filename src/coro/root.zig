@@ -49,7 +49,6 @@ pub const Coro = struct {
         self.state = .suspended;
         defer tls_current_coro = prev;
         switchContext(&self.ctx, &self.caller_ctx);
-        tls_current_coro = null;
         return self.resume_val;
     }
 
@@ -59,11 +58,10 @@ pub const Coro = struct {
         self.state = .suspended;
         defer tls_current_coro = prev;
         switchContext(&self.ctx, &self.caller_ctx);
-        tls_current_coro = null;
         return self.resume_val;
     }
 
-    pub fn start(self: *Coro, func: *const fn (*Coro) void) void {
+    pub fn start(self: *Coro, func: *const fn (*Coro) void) !void {
         std.debug.assert(self.state == .ready);
 
         const stack = self.pool.stackFor(self);
@@ -87,23 +85,23 @@ pub const Coro = struct {
         trampoline_coro = self;
         trampoline_func = func;
         self.state = .running;
-        resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
+        try resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
     }
 
-    pub fn cont(self: *Coro) void {
+    pub fn cont(self: *Coro) !void {
         std.debug.assert(self.state == .suspended);
 
         self.resume_val = .none;
         self.state = .running;
-        resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
+        try resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
     }
 
-    pub fn contWith(self: *Coro, val: YieldValue) void {
+    pub fn contWith(self: *Coro, val: YieldValue) !void {
         std.debug.assert(self.state == .suspended);
 
         self.resume_val = val;
         self.state = .running;
-        resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
+        try resumeOnCurrentThread(self, &self.caller_ctx, &self.ctx);
     }
 
     pub fn current() *Coro {
@@ -165,6 +163,7 @@ pub const Pool = struct {
     all: ?*CoroNode = null,
     idle: ?*CoroNode = null,
     next_index: usize = 0,
+    index_map: std.ArrayListUnmanaged(?*Coro) = .{},
 
     pub fn init(options: Options) Pool {
         return .{ .options = options };
@@ -197,6 +196,15 @@ pub const Pool = struct {
             .pool = self,
             .index = self.next_index,
         };
+        self.index_map.ensureTotalCapacity(std.heap.page_allocator, self.next_index + 1) catch {
+            node.stack.deinit();
+            freeNode(node);
+            return null;
+        };
+        while (self.index_map.items.len <= self.next_index) {
+            self.index_map.appendAssumeCapacity(null);
+        }
+        self.index_map.items[self.next_index] = &node.coro;
         self.next_index += 1;
 
         node.all_next = self.all;
@@ -220,11 +228,8 @@ pub const Pool = struct {
     }
 
     pub fn lookup(self: *Pool, index: usize) ?*Coro {
-        var node = self.all;
-        while (node) |n| : (node = n.all_next) {
-            if (n.coro.index == index) return &n.coro;
-        }
-        return null;
+        if (index >= self.index_map.items.len) return null;
+        return self.index_map.items[index];
     }
 
     pub fn resetAll(self: *Pool) void {
@@ -248,6 +253,7 @@ pub const Pool = struct {
             freeNode(n);
             node = next;
         }
+        self.index_map.deinit(std.heap.page_allocator);
         self.* = .{ .options = self.options };
     }
 };
@@ -279,8 +285,8 @@ fn coroTrampoline() void {
     unreachable;
 }
 
-fn resumeOnCurrentThread(self: *Coro, from: *Context, to: *const Context) void {
-    ensureSignalStackInstalled() catch unreachable;
+fn resumeOnCurrentThread(self: *Coro, from: *Context, to: *const Context) !void {
+    try ensureSignalStackInstalled();
     ensureSegvActionInstalled();
     const prev = tls_current_coro;
     tls_current_coro = self;
@@ -330,7 +336,9 @@ fn segvHandler(sig: i32, info: *const linux.siginfo_t, _: ?*anyopaque) callconv(
 }
 
 fn delegateSegv(sig: i32) void {
-    _ = linux.sigaltstack(&previous_signal_stack, null);
+    if (signal_stack_installed) {
+        _ = linux.sigaltstack(&previous_signal_stack, null);
+    }
     if (previous_segv_action_installed) {
         _ = linux.sigaction(linux.SIG.SEGV, &previous_segv_action, null);
     }
@@ -373,6 +381,72 @@ test "pool acquires and releases coroutines" {
     try std.testing.expect(co.state == .ready);
     pool.release(co);
     try std.testing.expect(co.state == .idle);
+}
+
+test "coroutine start yield and resume updates user data" {
+    const Job = struct {
+        value: usize = 0,
+
+        fn run(co: *Coro) void {
+            const job: *@This() = @ptrCast(@alignCast(co.user_data.?));
+            job.value = 1;
+            _ = co.yield();
+            job.value = 2;
+        }
+    };
+
+    var pool = Pool.init(.{});
+    defer pool.deinit();
+
+    var job = Job{};
+    const co = pool.acquire() orelse return error.TestUnexpectedResult;
+    co.user_data = &job;
+
+    try co.start(Job.run);
+    try std.testing.expectEqual(@as(usize, 1), job.value);
+    try std.testing.expectEqual(State.suspended, co.state);
+
+    try co.cont();
+    try std.testing.expectEqual(@as(usize, 2), job.value);
+    try std.testing.expectEqual(State.idle, co.state);
+
+    pool.release(co);
+}
+
+test "coroutine supports multiple yield boundaries" {
+    const Job = struct {
+        value: usize = 0,
+
+        fn run(co: *Coro) void {
+            const job: *@This() = @ptrCast(@alignCast(co.user_data.?));
+            job.value = 1;
+            _ = co.yield();
+            job.value = 2;
+            _ = co.yield();
+            job.value = 3;
+        }
+    };
+
+    var pool = Pool.init(.{});
+    defer pool.deinit();
+
+    var job = Job{};
+    const co = pool.acquire() orelse return error.TestUnexpectedResult;
+    co.user_data = &job;
+
+    try co.start(Job.run);
+    try std.testing.expectEqual(@as(usize, 1), job.value);
+    try std.testing.expectEqual(State.suspended, co.state);
+
+    try co.cont();
+    try std.testing.expectEqual(@as(usize, 2), job.value);
+    try std.testing.expectEqual(State.suspended, co.state);
+
+    try co.cont();
+    try std.testing.expectEqual(@as(usize, 3), job.value);
+    try std.testing.expectEqual(State.idle, co.state);
+
+    pool.release(co);
 }
 
 test "child scope inherits cancellation" {

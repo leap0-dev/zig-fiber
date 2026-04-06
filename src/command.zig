@@ -23,6 +23,7 @@ pub const Command = struct {
     env_list: ?[]const []const u8 = null,
     timeout_secs: u32 = 0,
     cancel_token: ?*coro.CancelToken = null,
+    cancel_scope: ?*coro.Scope = null,
 
     pub fn shell(command: []const u8) Command {
         return .{ .command = command };
@@ -49,11 +50,13 @@ pub const Command = struct {
 
     pub fn cancelToken(self: *Command, token: *coro.CancelToken) *Command {
         self.cancel_token = token;
+        self.cancel_scope = null;
         return self;
     }
 
     pub fn scope(self: *Command, value: *coro.Scope) *Command {
-        self.cancel_token = value.token();
+        self.cancel_scope = value;
+        self.cancel_token = null;
         return self;
     }
 
@@ -65,7 +68,7 @@ pub const Command = struct {
 
         const co = coro.Coro.maybeCurrent() orelse return error.NotInCoro;
         const inherited_cancel_token = co.getCancelToken();
-        try checkCancellation(self.cancel_token, inherited_cancel_token);
+        try checkCancellation(self.cancel_token, self.cancel_scope, inherited_cancel_token);
 
         var cmd_buf: [4096]u8 = undefined;
         var cmd_len: usize = 0;
@@ -200,7 +203,7 @@ pub const Command = struct {
             .stderr_fd = stderr_watch_fd,
             .child_pid = pid,
             .timeout_sec = self.timeout_secs,
-        } }, self.cancel_token, inherited_cancel_token);
+        } }, self.cancel_token, self.cancel_scope, inherited_cancel_token);
         cleanup_stdout_fd = -1;
         cleanup_stderr_fd = -1;
 
@@ -212,7 +215,7 @@ pub const Command = struct {
         var done = false;
 
         while (!done) {
-            try checkCancellation(self.cancel_token, inherited_cancel_token);
+            try checkCancellation(self.cancel_token, self.cancel_scope, inherited_cancel_token);
 
             switch (co.resume_val) {
                 .pipe_data => |pipe_data| {
@@ -221,7 +224,7 @@ pub const Command = struct {
                     } else if (pipe_data.fd == stderr_watch_fd and !pipe_data.eof) {
                         try co.stderr_buf.append(pipe_data.buf[0..pipe_data.len]);
                     }
-                    _ = try yieldChecked(co, self.cancel_token, inherited_cancel_token);
+                    _ = try yieldChecked(co, self.cancel_token, self.cancel_scope, inherited_cancel_token);
                 },
                 .child_exited => |code| {
                     exit_code = code;
@@ -247,24 +250,25 @@ pub const Command = struct {
     }
 };
 
-fn checkCancellation(token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) coro.CancelError!void {
-    if (isAnyCancelled(token, inherited)) return error.Cancelled;
+fn checkCancellation(token: ?*coro.CancelToken, scope: ?*coro.Scope, inherited: ?*coro.CancelToken) coro.CancelError!void {
+    if (isAnyCancelled(token, scope, inherited)) return error.Cancelled;
 }
 
-fn yieldChecked(co: *coro.Coro, token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) coro.CancelError!coro.YieldValue {
+fn yieldChecked(co: *coro.Coro, token: ?*coro.CancelToken, scope: ?*coro.Scope, inherited: ?*coro.CancelToken) coro.CancelError!coro.YieldValue {
     const val = co.yield();
-    try checkCancellation(token, inherited);
+    try checkCancellation(token, scope, inherited);
     return val;
 }
 
-fn yieldWithChecked(co: *coro.Coro, val: coro.YieldValue, token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) coro.CancelError!coro.YieldValue {
+fn yieldWithChecked(co: *coro.Coro, val: coro.YieldValue, token: ?*coro.CancelToken, scope: ?*coro.Scope, inherited: ?*coro.CancelToken) coro.CancelError!coro.YieldValue {
     const out = co.yieldWith(val);
-    try checkCancellation(token, inherited);
+    try checkCancellation(token, scope, inherited);
     return out;
 }
 
-fn isAnyCancelled(token: ?*coro.CancelToken, inherited: ?*coro.CancelToken) bool {
+fn isAnyCancelled(token: ?*coro.CancelToken, scope: ?*coro.Scope, inherited: ?*coro.CancelToken) bool {
     if (token) |value| if (value.isCancelled()) return true;
+    if (scope) |value| if (value.isCancelled()) return true;
     if (inherited) |value| if (value.isCancelled()) return true;
     return false;
 }
@@ -526,21 +530,65 @@ test "command validates input" {
 }
 
 test "command reports pre-cancelled token" {
+    const Job = struct {
+        cmd: Command,
+        err: ?anyerror = null,
+
+        fn run(co: *coro.Coro) void {
+            const job: *@This() = @ptrCast(@alignCast(co.user_data.?));
+            _ = job.cmd.run() catch |err| {
+                job.err = err;
+                return;
+            };
+        }
+    };
+
     var token: coro.CancelToken = .{};
     token.cancel();
 
     var cmd = Command.shell("echo hi");
     _ = cmd.cancelToken(&token);
-    try std.testing.expectError(error.Cancelled, cmd.run());
+
+    var job = Job{ .cmd = cmd };
+    var pool = coro.Pool.init(.{});
+    defer pool.deinit();
+
+    const co = pool.acquire() orelse return error.TestUnexpectedResult;
+    co.user_data = &job;
+    try co.start(Job.run);
+    try std.testing.expectError(error.Cancelled, job.err orelse error.TestUnexpectedResult);
+    pool.release(co);
 }
 
 test "command reports pre-cancelled scope" {
+    const Job = struct {
+        cmd: Command,
+        err: ?anyerror = null,
+
+        fn run(co: *coro.Coro) void {
+            const job: *@This() = @ptrCast(@alignCast(co.user_data.?));
+            _ = job.cmd.run() catch |err| {
+                job.err = err;
+                return;
+            };
+        }
+    };
+
     var scope = coro.Scope.init();
     scope.cancel();
 
     var cmd = Command.shell("echo hi");
     _ = cmd.scope(&scope);
-    try std.testing.expectError(error.Cancelled, cmd.run());
+
+    var job = Job{ .cmd = cmd };
+    var pool = coro.Pool.init(.{});
+    defer pool.deinit();
+
+    const co = pool.acquire() orelse return error.TestUnexpectedResult;
+    co.user_data = &job;
+    try co.start(Job.run);
+    try std.testing.expectError(error.Cancelled, job.err orelse error.TestUnexpectedResult);
+    pool.release(co);
 }
 
 test "command requires current coroutine" {

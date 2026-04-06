@@ -122,7 +122,11 @@ pub const Runtime = struct {
         return switch (co.yield_val) {
             .watch_pipes => |pipes| blk: {
                 beginWatch(driver, &self.state, pipes, co.index);
-                break :blk if (co.yield_val == .completed) .completed else .pending;
+                break :blk switch (co.yield_val) {
+                    .watch_pipes => .pending,
+                    .completed => .completed,
+                    else => try self.handleYield(driver, co),
+                };
             },
             .completed => .completed,
             else => error.UnexpectedYield,
@@ -188,7 +192,7 @@ pub fn beginWatch(driver: anytype, runtime: *RuntimeState, pipes: coro.WatchPipe
         const co = runtime.coro_ref orelse return;
         const exit_status = runtime.pipe_state.exit_status;
         runtime.pipe_state.reset();
-        co.contWith(.{ .child_exited = exit_status });
+        co.contWith(.{ .child_exited = exit_status }) catch unreachable;
         return;
     }
     if (runtime.pipe_state.stdout_eof and runtime.pipe_state.stderr_eof and !runtime.pipe_state.child_exited) {
@@ -382,12 +386,12 @@ fn handlePipeReadCompletion(runtime: *RuntimeState, co: *coro.Coro, cqe_res: i32
             .stdout => ps.stdout_eof = true,
             .stderr => ps.stderr_eof = true,
         }
-        co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf[0..].ptr, .len = 0, .eof = true } });
+        co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf[0..].ptr, .len = 0, .eof = true } }) catch unreachable;
         return;
     }
 
     if (cqe_res < 0) {
-        co.contWith(.{ .pipe_read_error = .{ .fd = fd, .errno = -cqe_res } });
+        co.contWith(.{ .pipe_read_error = .{ .fd = fd, .errno = -cqe_res } }) catch unreachable;
         return;
     }
 
@@ -397,21 +401,21 @@ fn handlePipeReadCompletion(runtime: *RuntimeState, co: *coro.Coro, cqe_res: i32
     }
 
     const n: usize = @intCast(cqe_res);
-    co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf, .len = n, .eof = false } });
+    co.contWith(.{ .pipe_data = .{ .fd = fd, .buf = buf, .len = n, .eof = false } }) catch unreachable;
 }
 
 fn finishExited(driver: anytype, runtime: *RuntimeState, co: *coro.Coro, callback_ctx: anytype, comptime on_yield: anytype) void {
     const exit_status = runtime.pipe_state.exit_status;
     if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
     runtime.pipe_state.reset();
-    co.contWith(.{ .child_exited = exit_status });
+    co.contWith(.{ .child_exited = exit_status }) catch unreachable;
     on_yield(callback_ctx, co, runtime);
 }
 
 fn finishTimedOut(driver: anytype, runtime: *RuntimeState, co: *coro.Coro, callback_ctx: anytype, comptime on_yield: anytype) void {
     if (runtime.pipe_state.timeout_sec > 0) cancelTimeout(driver, runtime);
     runtime.pipe_state.reset();
-    co.contWith(.child_timed_out);
+    co.contWith(.child_timed_out) catch unreachable;
     on_yield(callback_ctx, co, runtime);
 }
 
